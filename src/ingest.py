@@ -89,6 +89,26 @@ def extract_pdf_text(path: Path) -> str:
     return _resolve_known_cid_placeholders("\n".join(parts))
 
 
+_HEADER_FOOTER_ATTRS = (
+    "header",
+    "footer",
+    "first_page_header",
+    "first_page_footer",
+    "even_page_header",
+    "even_page_footer",
+)
+
+
+def _header_footer_parts(part) -> list[str]:
+    parts: list[str] = [p.text for p in part.paragraphs if p.text.strip()]
+    for table in part.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    parts.append(cell.text)
+    return parts
+
+
 def extract_docx_text(path: Path) -> str:
     document = Document(path)
     parts: list[str] = [p.text for p in document.paragraphs if p.text.strip()]
@@ -97,6 +117,19 @@ def extract_docx_text(path: Path) -> str:
             for cell in row.cells:
                 if cell.text.strip():
                     parts.append(cell.text)
+
+    # Headers/footers are separate parts that Document.paragraphs never
+    # touches. A CV in this corpus hides a prompt-injection payload in
+    # white-on-white header text specifically because it's invisible both
+    # to a human skimming the document and to naive paragraph-only
+    # extraction -- src/trust.py can't flag what src/ingest.py never sees.
+    for section in document.sections:
+        for attr in _HEADER_FOOTER_ATTRS:
+            part = getattr(section, attr)
+            if part.is_linked_to_previous:
+                continue
+            parts.extend(_header_footer_parts(part))
+
     return "\n".join(parts)
 
 
