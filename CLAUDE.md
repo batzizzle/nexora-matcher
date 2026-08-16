@@ -39,3 +39,30 @@ src/brief.py       LLM -> ProjectBrief schema
 src/match.py       filter -> retrieve -> rerank -> assemble
 src/explain.py     score breakdown, evidence, counterfactual
 app.py             Streamlit UI
+
+## Documentation rules
+
+Every Python file starts with a docstring containing, in plain English and
+understandable by a non-programmer:
+  - What this file does, in one sentence
+  - Why it exists / what problem it solves
+  - What it takes in and what it produces
+  - Any assumption or shortcut taken, and why
+
+Every function gets a one-line docstring. Comment the WHY, not the WHAT.
+"# weight semantic higher than keyword because skill synonyms matter more
+than exact matches" is useful. "# add 1 to counter" is noise.
+
+Flag every hardcoded number (score weights, thresholds, top-k values) with
+a comment stating it is a tunable PoC assumption, not a validated value.
+
+## Decision log
+
+Maintain DECISIONS.md. At the end of each build phase, append an entry:
+  - What was built
+  - Key design decisions and the alternative rejected
+  - Assumptions made
+  - Known limitations and what would need to change for production
+
+Keep CLAUDE.md limited to durable rules, schema and stack facts. Narrative,
+history and reasoning go in DECISIONS.md.
