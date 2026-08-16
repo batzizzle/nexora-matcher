@@ -1,4 +1,31 @@
-"""Format router: pdf/docx/pptx -> raw text + metadata."""
+"""Turn raw CV files into plain text the rest of the pipeline can read.
+
+What this does: reads every PDF, Word, and PowerPoint CV in a folder and
+converts each one into a single block of text.
+
+Why it exists: consultants' CVs arrive as wildly different file formats and
+page layouts. Nothing downstream (trust-checking, LLM extraction, matching)
+can work with a CV until it has been reduced to plain text -- and that text
+has to be complete and correctly spelled, or every later step silently works
+from the wrong data.
+
+What it takes in / produces: input is a folder path containing .pdf/.docx/
+.pptx files. Output is a list of dicts -- one per CV, or one per slide for a
+multi-CV PowerPoint deck -- each holding which file it came from, what
+format it was, the extracted text, and when it was extracted.
+
+Assumptions and shortcuts taken:
+- A file that fails to parse is skipped and logged rather than aborting the
+  whole batch, since one bad CV shouldn't block everyone else's.
+- Headers and footers are extracted alongside the document body, because one
+  CV in this dataset hides a prompt-injection attempt in invisible
+  (white-on-white) header text -- text src/trust.py can only flag if
+  src/ingest.py actually captured it.
+- A handful of PDF font-encoding quirks specific to this dataset (Danish
+  letters and typographic ligatures rendered as unresolved font codes) are
+  patched with fixes verified against the actual files, not solved in
+  general -- see the comments below for the evidence behind each one.
+"""
 
 from __future__ import annotations
 
@@ -33,10 +60,12 @@ _GLYPH_NAME_CODE_RE = re.compile(r"^[A-Za-z]?(\d+)$")
 
 
 def _patch_pdfminer_danish_glyph_fallback() -> None:
+    """Make pdfminer resolve Danish letters (æøå) correctly in PDFs that use non-standard font glyph names."""
     winansi = _pdfminer_encodingdb.EncodingDB.encodings.get("WinAnsiEncoding", {})
     original_name2unicode = _pdfminer_encodingdb.name2unicode
 
     def patched_name2unicode(name: str) -> str:
+        """Resolve one glyph name to a character, falling back to WinAnsi only for the known Danish-letter codes."""
         try:
             return original_name2unicode(name)
         except Exception:
@@ -73,13 +102,17 @@ _CID_PLACEHOLDER_RE = re.compile(r"\(cid:(\d+)\)")
 
 
 def _resolve_known_cid_placeholders(text: str) -> str:
+    """Replace pdfminer's unresolved "(cid:N)" placeholders with the real characters they stand for, where known."""
+
     def replace(match: re.Match[str]) -> str:
+        """Look up the substitution for one matched placeholder, or leave it unchanged if unknown."""
         return _CID_PLACEHOLDER_SUBSTITUTIONS.get(match.group(1), match.group(0))
 
     return _CID_PLACEHOLDER_RE.sub(replace, text)
 
 
 def extract_pdf_text(path: Path) -> str:
+    """Pull all text out of one PDF file, page by page."""
     parts: list[str] = []
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
@@ -100,6 +133,7 @@ _HEADER_FOOTER_ATTRS = (
 
 
 def _header_footer_parts(part) -> list[str]:
+    """Collect the visible text (paragraphs and table cells) from one document header or footer."""
     parts: list[str] = [p.text for p in part.paragraphs if p.text.strip()]
     for table in part.tables:
         for row in table.rows:
@@ -110,6 +144,7 @@ def _header_footer_parts(part) -> list[str]:
 
 
 def extract_docx_text(path: Path) -> str:
+    """Pull all text out of one Word file, including tables and every header/footer variant."""
     document = Document(path)
     parts: list[str] = [p.text for p in document.paragraphs if p.text.strip()]
     for table in document.tables:
@@ -134,6 +169,7 @@ def extract_docx_text(path: Path) -> str:
 
 
 def _shape_text(shape: BaseShape) -> list[str]:
+    """Collect the visible text from one PowerPoint shape, recursing into grouped shapes."""
     parts: list[str] = []
     if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
         for sub_shape in shape.shapes:
@@ -150,6 +186,7 @@ def _shape_text(shape: BaseShape) -> list[str]:
 
 
 def extract_pptx_slides(path: Path) -> list[str]:
+    """Pull all text out of one PowerPoint file, returning one text block per slide."""
     presentation = Presentation(path)
     slide_texts: list[str] = []
     for slide in presentation.slides:
@@ -161,6 +198,7 @@ def extract_pptx_slides(path: Path) -> list[str]:
 
 
 def _make_record(source_file: str, fmt: str, raw_text: str) -> dict:
+    """Bundle one CV's extracted text together with where it came from and when it was processed."""
     return {
         "source_file": source_file,
         "format": fmt,
@@ -170,6 +208,7 @@ def _make_record(source_file: str, fmt: str, raw_text: str) -> dict:
 
 
 def ingest_directory(directory: str | Path) -> list[dict]:
+    """Convert every supported CV file in a folder into text records, skipping (and logging) any file that fails."""
     directory = Path(directory)
     if not directory.is_dir():
         raise FileNotFoundError(f"No such directory: {directory}")

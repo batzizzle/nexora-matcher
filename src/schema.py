@@ -1,4 +1,31 @@
-"""Pydantic schemas shared across ingestion, extraction, matching, and explanation."""
+"""Define the shapes of data every other module reads and writes.
+
+What this does: declares, in one place, exactly what a "consultant profile,"
+a "project brief," a "trust flag," and so on look like -- what fields they
+have, what type each field must be, and what values are and aren't allowed.
+
+Why it exists: several parts of this project ask an AI model to read a CV or
+a project brief and turn it into structured data. AI output can't be trusted
+blindly -- it might invent a field, use the wrong type, or return a value
+outside the allowed range. Every model call in this project is required to
+produce output that fits one of the shapes defined here; if it doesn't, that
+call fails loudly instead of quietly poisoning the rest of the pipeline with
+bad data.
+
+What it takes in / produces: this file defines shapes only -- it doesn't run
+any logic itself. Other modules import these definitions to validate the
+data they build or receive.
+
+Assumptions and shortcuts taken:
+- Every shape rejects unrecognised fields outright (`extra="forbid"`),
+  because a stray field from an AI response is more likely a hallucination
+  than a useful extra.
+- Some fields that could plausibly be missing from a CV or a project brief
+  (e.g. a consultant's location, a brief's budget) are still required or
+  left un-flagged as inferred, because deciding exactly which fields are
+  safe to guess versus must be read verbatim is a judgment call left to the
+  extraction prompts (src/extract.py, src/brief.py), not to this schema.
+"""
 
 from __future__ import annotations
 
@@ -30,6 +57,8 @@ TrustSeverity = Literal["low", "medium", "high"]
 
 
 class TrustFlag(BaseModel):
+    """One suspicious piece of CV text, with what it looked like and how serious it is."""
+
     model_config = ConfigDict(extra="forbid")
 
     span: str = Field(min_length=1, description="The matched text that triggered the flag.")
@@ -39,6 +68,8 @@ class TrustFlag(BaseModel):
 
 
 class Skill(BaseModel):
+    """One skill a consultant has, backed by the CV sentence that proves it."""
+
     model_config = ConfigDict(extra="forbid")
 
     name: str
@@ -51,6 +82,8 @@ class Skill(BaseModel):
 
 
 class Language(BaseModel):
+    """One language a consultant speaks, and how well."""
+
     model_config = ConfigDict(extra="forbid")
 
     name: str
@@ -58,6 +91,8 @@ class Language(BaseModel):
 
 
 class Project(BaseModel):
+    """One past project a consultant worked on, as listed on their CV."""
+
     model_config = ConfigDict(extra="forbid")
 
     title: str
@@ -70,6 +105,8 @@ class Project(BaseModel):
 
 
 class ConsultantProfile(BaseModel):
+    """Everything the matcher knows about one consultant, with no personal identifiers included."""
+
     model_config = ConfigDict(extra="forbid")
 
     consultant_id: str
@@ -104,6 +141,8 @@ class PersonalData(BaseModel):
 
 
 class RoleRequirement(BaseModel):
+    """One role a client's project needs staffed, e.g. "2 senior consultants"."""
+
     model_config = ConfigDict(extra="forbid")
 
     title: str
@@ -113,6 +152,8 @@ class RoleRequirement(BaseModel):
 
 
 class ProjectBrief(BaseModel):
+    """A client's staffing request, turned from free-text into structured fields the matcher can filter on."""
+
     model_config = ConfigDict(extra="forbid")
 
     client: str
