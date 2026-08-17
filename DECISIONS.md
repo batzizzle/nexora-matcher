@@ -121,13 +121,16 @@ module validates against (`ConsultantProfile`, `PersonalData`,
 - `_extract_full_name`'s skip-list of section headings is a fixed set
   discovered by inspecting this dataset's actual CVs; a CV with a
   differently-worded header (e.g. "Résumé" instead of "Curriculum Vitae")
-  could still be picked up as the "name" incorrectly.
+  could still be picked up as the "name" incorrectly. (An explicit `"Name:"`
+  label is now checked first and takes priority over this heuristic when
+  present — see Phase 2 (3d) below — but CVs with neither a label nor a
+  recognized skip-list heading are still exposed to this limitation.)
 - The stage-2 LLM call has no retry/backoff logic; a transient API failure
   during `scan_for_injection` currently propagates as an exception rather
   than being retried or degraded to a lower-confidence heuristic-only
   result.
 
-## Phase 3 — Extraction (`src/extract.py`)
+## Phase 2 (3c) — Extraction (`src/extract.py`)
 
 **What was built:** one Claude tool-use call per CV that turns raw text into
 a `ConsultantProfile`, wired into `src/trust.py`'s `scan_for_injection` and
@@ -216,3 +219,74 @@ a `ConsultantProfile`, wired into `src/trust.py`'s `scan_for_injection` and
   aren't verified against raw_text at runtime (noted above) and, by
   extension, why nothing downstream should treat `trust_flags` text as a
   verified quote rather than an LLM's best-effort explanation.
+
+## Phase 2 (3d) — Availability (`src/availability.py`)
+
+**What was built:** a synthetic weekly-availability generator that assigns
+every consultant in `data/processed/profiles.json` a bench status
+(`available` / `partly_booked` / `fully_booked`), free days per week, a next-
+free date, and (if booked) a current project, writing the result to
+`data/processed/availability.csv`. No LLM call involved — deterministic
+Python, matching this project's rule that anything downstream of extraction
+is plain code, not model judgement.
+
+**Key design decisions and the alternative rejected:**
+- **Turn the target 25/45/30 split into exact integer counts via
+  largest-remainder rounding, then shuffle with a seeded RNG** — rejected
+  drawing each consultant's status independently (e.g. `rng.choices` with
+  weights). At n=21, independent draws can land noticeably off the target
+  split on any given run; computing exact counts first and only using the
+  RNG to decide *which* consultant gets which status keeps the aggregate
+  distribution stable while still varying who lands where.
+- **Deterministically pick one strong data/AI consultant (by role-title
+  keyword, then ranked by seniority/skill-count/years) and force them to
+  `fully_booked`**, outside the random pool — rejected leaving this to
+  chance. The case brief specifically needs a "great-fit candidate who isn't
+  actually available" example for the trade-off view; leaving it to the RNG
+  risked a demo run where no strong data/AI candidate happened to land on
+  `fully_booked`.
+- **`next_free_date` is seeded only as an *offset* from real "today," not
+  a fixed calendar date** — rejected freezing the whole dataset (including
+  dates) to one fixed day. A demo should show availability relative to
+  whenever it's actually run; only the RNG choices (status assignment,
+  free-days values, project picks, week offsets) need to be reproducible,
+  not the absolute date.
+
+**Assumptions made:**
+- All availability values are fabricated — there's no real staffing/CRM
+  system behind this PoC. Project names are drawn from a small fictional
+  pool.
+- `available`/`partly_booked` consultants have `next_free_date` = today
+  (they already have some open capacity now); only `fully_booked`
+  consultants get a future date, `free_days_per_week` = 0. This treats
+  "next free" as "next date with *any* open capacity," not "next date fully
+  unbooked" — a defensible but not the only reasonable reading of the
+  column name.
+
+**Known limitations / what would need to change for production:**
+- `tests/test_availability.py` skips itself when
+  `data/processed/profiles.json` doesn't exist yet (it isn't committed —
+  see below), matching the same pattern `tests/test_ingest.py` and
+  `tests/test_trust.py` already use for `data/raw/`.
+- `data/processed/` was added to `.gitignore` at this point (it wasn't
+  before) because `personal_data.json` holds PII-shaped output and the
+  whole directory is fully reproducible from `data/raw/` via
+  `python -m src.extract` followed by `python -m src.availability` — it was
+  never meant to be a committed artifact.
+
+**Bugfix discovered while reviewing this phase's output (`src/trust.py`):**
+Manually reviewing `availability.csv` joined against `personal_data.json`
+surfaced that two consultants (`cv3`, `cv5`) had `full_name: "Deployment
+History"` — a section heading, not a person. Root cause: `CV3.docx` and
+`CV5.docx` put the name under a "Personal Information" section as
+`"Name: Mikkel T. Rasmussen"`; the mid-initial period means that line can't
+match `_extract_full_name`'s bare Title-Case-line heuristic, so it fell
+through to the first *unrelated* Title-Case heading further down the
+document instead. Fix: check for an explicit `"Name:"` label first (verified
+against all 21 CVs to appear in exactly 3 places, no false-positive risk),
+falling back to the existing bare-line heuristic only when no label is
+present — rejected just adding "deployment history" to the skip-list, since
+that would only have delayed the same failure mode to the next
+unrelated heading a future CV happens to use. Regression tests added in
+`tests/test_trust.py` against the real CV3/CV5 files. `data/processed/`
+was regenerated end to end (`extract` then `availability`) after the fix.

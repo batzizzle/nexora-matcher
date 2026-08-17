@@ -112,3 +112,30 @@ def test_separate_pii_strips_whitespace_from_extracted_phone(records):
     personal_data, _ = separate_pii(raw_text, profile)
 
     assert personal_data.phone == "+45 12345678"
+
+
+def test_separate_pii_prefers_name_label_over_unrelated_section_heading(records):
+    # CV3.docx puts the name under "Personal Information" as
+    # "Name: Mikkel T. Rasmussen" -- the mid-initial period means it can't
+    # match the bare Title-Case-line heuristic, which used to fall through
+    # to the first unrelated Title-Case section heading further down the
+    # document ("Deployment History") instead.
+    by_source = {r["source_file"]: r["raw_text"] for r in records}
+    raw_text = by_source["CV3.docx"]
+    profile = make_profile(consultant_id="cv3")
+
+    personal_data, _ = separate_pii(raw_text, profile)
+
+    assert personal_data.full_name == "Mikkel T. Rasmussen"
+
+
+def test_separate_pii_prefers_name_label_when_preceded_by_other_title_case_lines(records):
+    # CV5.docx has "Example Profile: Alexander Jensen" (not a name label)
+    # above the real "Name: Alexander Jensen" line.
+    by_source = {r["source_file"]: r["raw_text"] for r in records}
+    raw_text = by_source["CV5.docx"]
+    profile = make_profile(consultant_id="cv5")
+
+    personal_data, _ = separate_pii(raw_text, profile)
+
+    assert personal_data.full_name == "Alexander Jensen"

@@ -240,6 +240,7 @@ _PHONE_RE = re.compile(r"\+\d{1,3}[\s.-]?(?:\d[\s.-]?){6,12}")
 _LINKEDIN_RE = re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/\S+", re.IGNORECASE)
 _GITHUB_RE = re.compile(r"(?:https?://)?(?:www\.)?github\.com/\S+", re.IGNORECASE)
 _NAME_LINE_RE = re.compile(r"^[A-ZÆØÅ][a-zæøåA-ZÆØÅ'\-]+(?:\s+[A-ZÆØÅ][a-zæøåA-ZÆØÅ'\-]+){1,3}$")
+_NAME_LABEL_RE = re.compile(r"^name\s*:\s*(.+)$", re.IGNORECASE)
 _ADDRESS_LINE_SUFFIX_RE = re.compile(r"\b\w*(?:vej|gade|all[ée]|plads)\b", re.IGNORECASE)
 
 # Title-Case document headers that match the name-line shape but aren't a
@@ -261,7 +262,18 @@ def _first_match(pattern: re.Pattern[str], text: str) -> str | None:
 
 
 def _extract_full_name(raw_text: str) -> str | None:
-    """Guess a consultant's name as the first Title-Case line that isn't a known section heading."""
+    """Guess a consultant's name: prefer an explicit "Name:" label line, else the first Title-Case line that isn't a known section heading."""
+    # An explicit "Name:" label is a stronger signal than line shape alone --
+    # some CVs in this dataset (CV3, CV5) put the name under a "Personal
+    # Information" section as "Name: Mikkel T. Rasmussen", which the
+    # Title-Case-line heuristic below can't match (it contains a
+    # mid-initial period) and so falls through to the first *unrelated*
+    # Title-Case section heading further down the document instead.
+    for line in raw_text.splitlines():
+        label_match = _NAME_LABEL_RE.match(line.strip())
+        if label_match and label_match.group(1).strip():
+            return label_match.group(1).strip()
+
     for line in raw_text.splitlines():
         candidate = line.strip()
         if not candidate or candidate.lower() in _NAME_LINE_SKIP:
