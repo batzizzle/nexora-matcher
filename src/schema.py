@@ -306,6 +306,13 @@ class EvidenceQuote(BaseModel):
     project_title: str | None = Field(
         default=None, description="Best-effort attribution via tech-list overlap; None if no project could be matched."
     )
+    matched_requirement: bool = Field(
+        description=(
+            "Whether skill_name is an exact match to one of the role's required_skills or the brief's "
+            "must_have_skills. False means this is the candidate's best general skill, shown because rule 4 "
+            "requires every score to carry evidence, NOT because it actually relates to what was asked."
+        )
+    )
 
 
 class Counterfactual(BaseModel):

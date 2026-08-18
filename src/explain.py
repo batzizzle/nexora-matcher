@@ -59,6 +59,16 @@ Assumptions and shortcuts taken:
   attribution is a best-effort guess: the first project whose `tech` list names the
   skill, or None if no project does. There's no structural link between a Skill and
   a Project in src/schema.py, so this is a heuristic, not a guarantee.
+- Every EvidenceQuote is tagged matched_requirement: whether that skill actually
+  matches the role's required_skills/brief's must_have_skills, or is just the
+  candidate's best general skill shown because rule 4 requires every score to carry
+  evidence. Added after a real report: for an "Azure migration" brief, several
+  shortlisted candidates had zero Azure/cloud skills at all (the real specialists
+  were fully_booked, thinning the shortlist retrieval had to rank), and their cards
+  showed generic high-confidence skills as unqualified "Evidence" -- technically
+  satisfying rule 4, but visually implying relevance that wasn't there. Callers
+  (src/app.py) are expected to render matched_requirement=False evidence visibly
+  differently, not hide it -- CLAUDE.md rule 4 still requires it be shown.
 - The trust badge only distinguishes three states from data already computed upstream
   (ConsultantProfile.trust_flags, extraction_confidence) -- it does not re-verify that
   any evidence quote is an actual substring of the raw CV text, which is the same
@@ -267,6 +277,17 @@ def classify_trust(profile: ConsultantProfile) -> TrustBadge:
     return "verified"
 
 
+def is_confirmed_trust_finding(flag: str) -> bool:
+    """Whether one trust_flags entry is a structured, confirmed finding rather than a self-reported free-text note.
+
+    Exposed publicly (unlike _CONFIRMED_TRUST_PREFIXES) so callers outside this module -- e.g. app.py's
+    Data Quality panel -- can apply the exact same classify_trust distinction when listing individual
+    flags, instead of re-deriving their own (weaker) rule and reintroducing the bug classify_trust's
+    docstring describes.
+    """
+    return flag.startswith(_CONFIRMED_TRUST_PREFIXES)
+
+
 def _attribute_project(skill_name: str, projects: list[Project]) -> str | None:
     """Best-effort guess at which project a skill claim came from: the first project whose tech list names it."""
     target = skill_name.strip().lower()
@@ -286,6 +307,15 @@ def select_evidence(
     src/extract.py's prompt requires a verbatim quote, and a skills-list line is a legitimate verbatim quote
     when the CV has nothing more specific per-skill). Without deduping, a card could show the same "sentence"
     three times, which defeats the point of three *distinct* pieces of evidence.
+
+    Every returned quote is tagged matched_requirement (see EvidenceQuote) so a candidate with zero skills
+    matching what was actually asked for still gets evidence -- CLAUDE.md rule 4 requires every score to
+    carry evidence, so this never returns fewer than min(top_n, len(profile.skills)) -- but nothing is
+    silently presented as relevant when it isn't. Discovered necessary from a real report: for an "Azure
+    migration" brief, several candidates with zero Azure/cloud skills were shortlisted (retrieval imprecision
+    against a shortlist thinned by availability -- the real Azure specialists were fully_booked), and their
+    cards showed generic high-confidence skills as "Evidence" with no indication they had nothing to do with
+    Azure. The card was technically accurate (rule 4 was satisfied) but visually misleading.
     """
     required = {s.strip().lower() for s in [*role.required_skills, *brief.must_have_skills]}
     ranked = sorted(
@@ -307,6 +337,7 @@ def select_evidence(
                 quote=skill.evidence,
                 skill_name=skill.name,
                 project_title=_attribute_project(skill.name, profile.projects),
+                matched_requirement=skill.name.strip().lower() in required,
             )
         )
     return quotes

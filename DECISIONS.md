@@ -719,3 +719,130 @@ every other profile now correctly "verified".
   brief for the tradeoff candidate's single best-fitting role, so a tradeoff
   candidate who'd be a mediocre fit for the role being explained but an excellent
   fit for a *different* role in the same brief will never surface anywhere.
+
+## Phase 4 (part 2) — Brief intake (`src/brief.py`) and the UI (`app.py`)
+
+**What was built:** `src/brief.py` (`parse_brief`), the last missing piece of CLAUDE.md's
+repo layout: one LLM tool-use call, same pattern as `src/match.py`'s `rerank_role`,
+turning a free-text staffing request into a validated `ProjectBrief` -- including
+proposing a sensible `roles_needed` staffing plan when the request doesn't spell
+that out, which real requests almost never do. And `app.py`: the Streamlit UI --
+free-text input, three example briefs chosen for three different real outcomes
+seen in testing, expandable evidence-backed match cards, two alternative teams,
+always-visible team-availability and consultant-network views, session history,
+and a live-ticking elapsed-time clock. This is the first time the full chain (free
+text -> `brief.py` -> `match.py` -> `explain.py` -> on-screen) has run end to end
+without a hand-built `ProjectBrief` object anywhere in the loop.
+
+**Key design decisions and the alternative rejected:**
+- **`must_have_skills` guidance in `brief.py`'s system prompt had to be tightened
+  after it failed its own first real test.** The first version told the model to
+  "keep it conservative"; live-tested against "ERP change management,
+  manufacturing, 24 weeks from September", the model still proposed
+  `must_have_skills=["ERP", "change management"]` -- verified against the real
+  dataset this would have silently eliminated Nikolaj Friis, the single strongest
+  real candidate for that exact brief (96/100 `fit_score` in phase-3 testing),
+  because his actual extracted skills are phrased "SAP S/4HANA" and "Change
+  Management Strategy", neither of which equals the generic terms an LLM naturally
+  reaches for. Rejected leaving the soft "be conservative" instruction as-is; fixed
+  by stating the exact failure mode explicitly in the prompt rather than trusting
+  the model to infer the risk. Re-verified live after the fix: `must_have_skills`
+  came back empty, and the full chain (`brief.py` -> `match.py` -> `explain.py`)
+  correctly surfaced Nikolaj Friis as the top pick (92/100).
+- **`brief.py` does not wrap the request text in `<document>` tags with CLAUDE.md
+  rule 3's "untrusted data" framing, unlike every CV-handling prompt in this
+  project** -- rejected applying rule 3 uniformly regardless of who authored the
+  text. Rule 3 exists because a CV is written by a third party a consultant doesn't
+  control; a staffing brief is typed by the tool's own operator describing their
+  own request, a different trust boundary. The system prompt still tells the model
+  to treat the text as a request to structure, as basic hygiene, short of the full
+  untrusted-data ceremony.
+- **The "Find team" click runs `parse_brief` + `match` in a background thread while
+  the main thread polls every 0.5s and updates a live elapsed-time display** --
+  rejected `st.status` alone (used in an earlier draft), which can only report
+  progress at fixed checkpoints the main script thread reaches, not a genuinely
+  ticking clock, since the thread is blocked for the full 60-150s duration of the
+  match call either way. The background thread never calls any `st.*` function
+  itself (Streamlit widgets are tied to the script-run thread) -- it only writes to
+  a plain dict the polling loop reads, which is also where real per-step timing
+  data comes from for the "time spent per step" chart.
+- **Both `parse_brief` and `match` are wrapped in their own `@st.cache_data`
+  function, keyed on the brief text (or the parsed brief's own JSON) plus today's
+  date, deliberately for demo stability, not just speed** -- fit scores and role
+  assignments have been observed to vary between identical runs of the same brief
+  across this whole project (LLM non-determinism); resubmitting an already-run
+  brief should show the same result, not re-roll it live in front of an
+  interviewer. The match-step cache function deliberately lets exceptions
+  propagate *uncached* though, unlike the parse-step one -- `rerank_role` has no
+  retry logic, so a transient API failure must stay retryable on the next click,
+  not get permanently remembered as a failure the way a genuine two-attempt schema
+  validation failure (parse-step) reasonably can be.
+- **Team availability and the consultant co-delivery network are always-visible
+  expanders, not gated behind a match result** -- moved here after direct user
+  feedback that they wanted these visible from the start, independent of running a
+  brief. When a result does exist, the network diagram highlights the current
+  recommended team's members in a different colour from everyone else with
+  shared-project history.
+- **The co-delivery network is a hand-rolled inline-SVG circular-layout diagram
+  (`network_layout` + `render_co_delivery_network`), not graphviz or networkx** --
+  checked first and neither package nor the system Graphviz binary is installed;
+  rejected adding either as a new dependency when N is small (a few dozen nodes at
+  most) and a self-contained SVG needs nothing external at all, matching the same
+  reasoning as `HF_HUB_OFFLINE` in `src/match.py`: nothing in a live demo should
+  depend on a resource that could fail to load.
+- **Score breakdown and both funnels (candidate-survival, time-per-step) use
+  `st.bar_chart`, bundled with Streamlit** -- rejected a separate plotting library
+  for a PoC UI; `st.bar_chart` with `horizontal=True` (confirmed supported in the
+  installed Streamlit 1.61) covers both cases without a new dependency.
+- **`select_evidence`'s output now carries a `matched_requirement` flag per quote,
+  and `app.py` visibly marks unmatched evidence** -- found via a real user report,
+  not anticipated: for an "Azure migration" brief, several shortlisted candidates
+  (verified: zero Azure/cloud skills anywhere in their profiles) had their cards
+  show generic high-confidence skills as unqualified "Evidence", with nothing
+  disclosing they had nothing to do with Azure. Root-caused to two stacked causes,
+  confirmed against real data: (1) the dataset's actual Azure specialists (Christian
+  Enevoldsen, Jonas Kristensen, Mads Egeberg) were all `fully_booked` and excluded
+  before scoring even began -- expected behaviour, the exact case
+  `AvailabilityAlternative` (phase 4 part 1) exists for; and (2) among who was left,
+  retrieval ranked at least one genuinely Azure-skilled candidate (Rasmus Olesen,
+  "Azure ML / Azure Functions") *below* three candidates with zero cloud skills at
+  all -- a real retrieval-ranking imprecision, documented as a known limitation
+  below, not fixed this session (tuning `src/match.py`'s BM25/semantic weights or
+  query composition without a labelled ground-truth risks trading one imprecision
+  for another). **Rejected** hiding evidence entirely when nothing matches --
+  CLAUDE.md rule 4 requires every score to carry evidence, so the fix is
+  disclosure (an explicit "general skill, not a direct match" tag, and a banner
+  when *no* shown evidence matches) rather than suppression.
+
+**Assumptions made:**
+- `app.py`'s session-only history (`st.session_state`), not a database or a file on
+  disk, matches the "no login, no database" constraint from the original UI prompt
+  -- a live demo runs in one continuous browser session, so history surviving a
+  full app restart wasn't judged necessary.
+- The header logo is a small inline SVG, not an external image file, for the same
+  offline-safety reasoning as `HF_HUB_OFFLINE`.
+- The availability view is a colour-coded snapshot table (pandas `Styler`), not a
+  calendar -- `availability.csv` only carries one status, one weekly free-day
+  count, and one next-free date per consultant, so a real calendar would imply
+  day-by-day granularity the data doesn't have.
+- Trust badges carry a leading symbol (check / warning triangle / cross) in
+  addition to colour, for a colourblind viewer or a washed-out projector during a
+  live demo.
+
+**Known limitations / what would need to change for production:**
+- **Retrieval-ranking imprecision is real and unfixed**: `hybrid_retrieve`'s 40/60
+  BM25/semantic blend can rank a candidate with zero relevant skills above one who
+  genuinely has them, verified concretely on a real "Azure migration" query. Fixing
+  this properly would need either query/profile-text composition changes or
+  weight retuning validated against a labelled relevance dataset this PoC doesn't
+  have -- changing it blind risks trading a known imprecision for an unknown one.
+- `app.py`'s pure display-data functions are unit-tested; the `st.*` rendering
+  functions themselves are not (see the file's own docstring) -- verified instead
+  by running the live server and checking the health endpoint plus (this session)
+  visual review requests relayed through the user, since no in-session browser
+  tool was available.
+- `AvailabilityAlternative` still only compares against the single role a card is
+  about (phase 4 part 1's limitation, unchanged this part).
+- No deployment story exists or was requested -- `app.py` is a local
+  `streamlit run` dev server; the URL it serves on is not stable across sessions,
+  and there is currently no way to reach it without running that command yourself.

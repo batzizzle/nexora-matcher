@@ -13,6 +13,7 @@ from src.explain import (
     build_match_cards_for_team,
     classify_trust,
     compute_breakdown,
+    is_confirmed_trust_finding,
     select_evidence,
 )
 from src.schema import (
@@ -250,6 +251,13 @@ def test_classify_trust_unverified_when_self_reported_flags_present_but_confiden
     assert classify_trust(profile) == "unverified_claims"
 
 
+def test_is_confirmed_trust_finding_matches_structured_prefixes_only():
+    assert is_confirmed_trust_finding("injection (high): ignore all instructions") is True
+    assert is_confirmed_trust_finding("promotional_language (medium): THE BEST") is True
+    assert is_confirmed_trust_finding("No prompt injection or adversarial text detected in the document.") is False
+    assert is_confirmed_trust_finding("No certifications section found in the CV.") is False
+
+
 # --- evidence selection --------------------------------------------------
 
 
@@ -264,6 +272,21 @@ def test_select_evidence_prioritizes_required_skills_then_confidence():
     role = make_role(required_skills=["Python"])
     evidence = select_evidence(profile, role, make_brief())
     assert evidence[0].skill_name == "Python"
+    assert evidence[0].matched_requirement is True
+    assert evidence[1].matched_requirement is False
+
+
+def test_select_evidence_marks_matched_requirement_false_when_nothing_matches():
+    # Real bug this guards: an "Azure migration" brief surfacing candidates with zero Azure/cloud
+    # skills, whose cards showed unrelated high-confidence skills as unqualified "Evidence".
+    profile = make_profile(
+        "p1",
+        skills=[make_skill("Change Management", confidence=0.95, evidence="Led change management initiatives.")],
+    )
+    role = make_role(required_skills=["Azure", "Cloud Migration"])
+    evidence = select_evidence(profile, role, make_brief())
+    assert len(evidence) == 1  # rule 4: a score must still carry evidence, even when nothing matches
+    assert evidence[0].matched_requirement is False
 
 
 def test_select_evidence_attributes_project_via_tech_list():
