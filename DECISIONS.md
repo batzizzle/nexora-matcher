@@ -290,3 +290,229 @@ that would only have delayed the same failure mode to the next
 unrelated heading a future CV happens to use. Regression tests added in
 `tests/test_trust.py` against the real CV3/CV5 files. `data/processed/`
 was regenerated end to end (`extract` then `availability`) after the fix.
+
+## Phase 3 — Matching engine (`src/match.py`, `src/graph.py`)
+
+**What was built:** the four-stage matching pipeline — deterministic hard
+filter, hybrid BM25 + semantic retrieval, one LLM re-rank call per role, and
+deterministic team assembly producing a recommended team plus two
+alternatives (earliest start, lowest cost) — plus `src/graph.py`'s
+co-delivery adjacency graph. Smoke-tested end to end against the real
+21-CV/`availability.csv` dataset (no live LLM call): the hard filter funnel
+narrowed 21 → 15 → 14 → 7 → 7 on a realistic brief, the co-delivery graph
+found 4 real shared-project edges, and retrieval for a "Data Scientist" role
+surfaced data-scientist/ML-engineer/analytics-consultant profiles first.
+
+**Key design decisions and the alternative rejected:**
+- **Added `ProjectBrief.required_language: str | None`.** The phase-3 brief
+  requires a hard language filter, but the schema had no field to carry it.
+  This is a deliberate, narrowly-scoped addition — not the kind of
+  extraction-ambiguity schema change the user previously rejected (see
+  phase 2's "Ambiguous seniority-tier mapping" decision above); it adds a
+  genuinely missing piece of required data, not a mechanism for resolving
+  judgment calls.
+- **Co-delivery edges (`src/graph.py`) use only exact (case/whitespace-
+  normalised) `Project.title` matches, not the brief's requested "same
+  client+year" criterion** — rejected because `Project` has no client
+  field, and the next-best proxy, same industry + same `year_start`, was
+  tested against the real dataset and found to group 20 unrelated
+  engagements as "shared" purely for happening in the same industry the
+  same year. That would fabricate co-delivery bonuses between consultants
+  who never actually worked together, which is worse than under-counting.
+  Exact-title matching found 4 real edges in the dataset (including CV1/CV5
+  on "Complexity Reduction in Portfolio and Operations") at the cost of
+  missing pairs who describe the same engagement in different words (e.g.
+  "...Rollout" vs no suffix) — a real but bounded gap, documented in
+  `src/graph.py`'s docstring.
+- **"Lowest cost" team assembly uses a candidate's own seniority tier as a
+  cost proxy** — rejected leaving cost unimplemented, since nothing in this
+  project (`ConsultantProfile`, `PersonalData`, `availability.csv`) has a
+  rate-card or billing-rate field. Unlike the rejected industry+year
+  co-delivery proxy, seniority-as-cost is a defensible, close-to-universal
+  assumption in consulting, not a noisy one.
+- **Stage 1's must-have-skill and required-language filters use exact
+  (case-insensitive, trimmed) string matching, not fuzzy matching** —
+  rejected substring/fuzzy matching for these two hard filters specifically,
+  because a false-positive pass on a *hard* filter (recommending someone who
+  doesn't actually have the required skill) is a worse failure mode than a
+  false negative (a real match phrased differently gets dropped and is
+  invisible in the funnel, but at least never wrongly recommended). Location
+  matching is looser (substring either direction) because it's a softer,
+  more forgiving constraint by nature (e.g. "Copenhagen" vs "Copenhagen,
+  Denmark").
+- **"Availability in the project window" only checks that
+  `next_free_date <= parsed start_date`, not any end-of-window constraint**
+  — rejected trying to model `duration_weeks` against availability, because
+  `availability.csv` (src/availability.py) only stores one current bench
+  status and one next-free date per consultant, not a future calendar. There
+  is nothing to check an end date against.
+- **A small hand-rolled parser (`_parse_start_date`) handles ASAP-style
+  synonyms, ISO dates, "Q<n> YYYY", and "<Month> YYYY"; anything else is
+  treated as "no window constraint" (the filter is skipped, not applied)**
+  — rejected either crashing on unparseable text or defaulting to "today"
+  for anything unrecognised. A hard filter that silently passes everyone on
+  unparseable input is safer for a demo than one that silently drops
+  everyone; both are documented, but "pass" was judged the less surprising
+  failure mode for a staffing recommendation tool.
+- **`hybrid_retrieve` treats an all-empty BM25 corpus (no candidate has any
+  skill/project/industry/certification text) as "zero keyword signal for
+  everyone" rather than crashing** — discovered because `BM25Okapi` itself
+  divides by zero building its idf table when its corpus has no tokens.
+  Real profiles almost always have skills, but the failure mode (crashing
+  stage 2 entirely) was worse than the fix (skip BM25 scoring, rely on
+  semantic score alone) was risky.
+- **Stage 3's `rerank_role` has no retry-on-validation-failure**, unlike
+  `src/extract.py`'s extraction call — kept consistent with `src/trust.py`'s
+  stage-2 classification call, which has the same limitation for the same
+  reason (simplicity for a PoC; a transient bad response currently
+  propagates as an exception).
+- **The two alternative teams (earliest start, lowest cost) only optimise
+  within each role's top-5 LLM-fit-scored candidates
+  (`_ALT_TEAM_CANDIDATE_POOL`), and skip the recommended team's
+  complementarity/co-delivery/booking adjustments entirely** — rejected
+  either optimising across the full shortlist (risks recommending a
+  genuinely poor-fit candidate purely for being cheap or free sooner) or
+  applying the same adjustment stack (would blur what each alternative team
+  is actually optimised for). Restricting to a fit-scored top-5 keeps every
+  alternative a *plausible* team while still letting the one named
+  dimension (start date, cost) dominate the choice within it.
+
+**Assumptions made:**
+- All score-weighting constants (BM25/semantic 40/60, skill-overlap
+  penalty, co-delivery bonus, booking penalty, alt-team pool size, retrieval
+  top-k) are tunable PoC values flagged inline in `src/match.py`, not
+  validated against any ground truth — there is no labelled "good team"
+  dataset to validate against in this PoC.
+- Stage 4's role fill order sorts by `(-seniority_rank, surviving_candidate_
+  pool_size)` — most senior role first, ties broken by scarcity (fewest
+  ranked candidates) — a literal reading of the brief's "most senior/most
+  constrained role first," not a weighted combination of the two.
+
+**Known limitations / what would need to change for production:**
+- The co-delivery graph under-counts real co-delivery (exact-title matching
+  only, no client field to match on) — see above.
+- No cost/rate-card data exists anywhere in this project; "lowest cost" is a
+  seniority-tier proxy, not a real cost calculation.
+- `rerank_role` has no retry logic; a transient API failure or a malformed
+  tool-use response aborts that role's ranking (and therefore team
+  assembly) entirely.
+- `tests/test_match.py` and `tests/test_graph.py` use fake Anthropic clients
+  and fake embedding functions throughout, matching this project's existing
+  testing convention (see phase 2's `tests/test_extract.py`) — they verify
+  the pipeline's logic, not that the real `claude-sonnet-4-6` model's
+  tool-use output matches expectations, or that `all-MiniLM-L6-v2`'s actual
+  embeddings produce good semantic rankings. A real-data smoke test (hard
+  filter + retrieval only, no live LLM call, described above) exercised the
+  non-LLM stages against the actual dataset; stage 3's live LLM call and
+  full `match()` orchestration were not exercised against the real API in
+  this phase.
+
+### Phase 3 follow-ups from live demo testing
+
+Running real briefs end to end against the actual dataset and API (not just
+the fake-client test suite) surfaced four gaps, each fixed the same session:
+
+**1. `availability_tradeoffs` (src/schema.py, src/match.py).** Testing a
+"Cloud migration, Nordic retailer, 12 weeks" brief with `start_date="ASAP"`
+surfaced that the dataset's best-fit cloud architect, and two other strong
+candidates, were silently missing from every team -- all three were
+`fully_booked` and failed the stage-1 availability filter before the LLM
+ever saw them. Nothing in `MatchResult` said so; the user had to notice
+their absence and manually cross-reference `availability.csv` to find out
+why. Added `MatchResult.availability_tradeoffs`: every candidate who passes
+language/must-have-skills/location but fails only availability, with their
+`next_free_date` and how many days after the requested start that is.
+**Rejected:** generalising this into a full counterfactual across every
+hard filter ("who'd qualify if we dropped the language requirement") --
+that's CLAUDE.md's repo layout already scoping "counterfactual" to
+`src/explain.py`, a later phase; this is the one tradeoff cheap enough to
+compute here with data `hard_filter` already touches, and the one a user
+hits first in practice.
+
+**2. `HF_HUB_OFFLINE=1` (src/match.py `_get_embedder`).** Every embedder
+load printed a Hugging Face Hub rate-limit warning, because
+`sentence-transformers` checks Hub for cache freshness on every load even
+when the model is already cached locally. Not a security or correctness
+issue, but a live network dependency during an in-person case-interview
+demo is a real risk (flaky wifi, corporate proxy, Hub outage) for zero
+benefit once the model is cached. Set `HF_HUB_OFFLINE=1` via
+`os.environ.setdefault` before the model loads. **Rejected:** an `HF_TOKEN`
+instead -- a token raises rate limits but doesn't remove the live network
+call, so it doesn't fix the actual risk (demo-day flakiness); it also adds
+a secret to manage for no corresponding benefit in a single-laptop demo
+context. **Trade-off accepted:** a machine that has never loaded the model
+before must run once with the flag unset (or `HF_HUB_OFFLINE=0`) to seed
+the cache -- irrelevant for this demo's one laptop, real for a fresh
+machine or CI.
+
+**3. `StaffingGap` / `Team.gaps` (src/schema.py, src/match.py).** Stress-
+testing a deliberately impossible brief ("Quantum Cryptographer, starting
+Monday" -- no one in a 21-person management/tech consulting dataset is a
+quantum specialist) showed the pipeline behaving correctly but silently: it
+returned a real person (the closest available AI/ML engineer) with an
+honest fit_score of 6-7/100 and a concern explicitly stating the role's
+core requirements were unmet -- but nothing structurally flagged that this
+"recommendation" shouldn't be trusted. A fit_score of 7 sitting quietly
+inside an otherwise normal-looking team card is easy to miss. Added
+`StaffingGap` (`role_title`, `reason: "understaffed" | "low_confidence_fit"`,
+`detail`, optional `consultant_id`) and `Team.gaps`, computed by
+`_staffing_gaps()` from each member's raw `fit_score` (not
+`assembly_score` -- a low fit is a genuine competence gap; a low assembly
+score can just mean a fine candidate was penalised for redundant skills or
+thin availability, a different kind of problem). Threshold
+`_LOW_CONFIDENCE_FIT_THRESHOLD = 30.0` is a tunable PoC cutoff, flagged
+inline, not validated against any labelled "this recommendation was
+actually bad" dataset -- none exists to validate against here. Also catches
+understaffed roles (fewer members than `role.count` demanded), reusing the
+same mechanism. Verified against the live quantum-cryptographer brief: all
+three teams now carry `gaps: [{reason: "low_confidence_fit", ...}]`
+alongside the same fit-7 suggestion, instead of the suggestion appearing
+unqualified.
+
+**4. Concurrent `rerank_role` calls (src/match.py `match()`).** Profiling a
+real brief found `rerank_role` (stage 3's live Claude call) taking 60-80s
+per role -- driven by output length (15 candidates x fit_score + 3 cited
+reasons + concern is ~3,000-4,000 generated tokens per call), not input
+size or embedding cost, which together stayed under 1 second total.
+Sequential, a 2-role brief spent ~150s in LLM calls alone, making the tool
+unusable live in a case interview; a brief with more roles would scale
+linearly and get worse. Since each role's ranking is independent of every
+other role's, `match()` now dispatches all `rerank_role` calls concurrently
+via `ThreadPoolExecutor` (threads, not asyncio, since each call is a single
+blocking HTTP request and the client library isn't async) and resolves one
+shared `anthropic.Anthropic()` client up front rather than letting each
+thread construct its own. **Rejected:** reducing `_RETRIEVAL_TOP_K` or
+trimming the candidate payload sent to the LLM to cut latency -- both would
+reduce evidence quality or shortlist breadth to solve a problem
+concurrency solves for free with no quality trade-off. Verified on the live
+cloud-migration brief: wall time dropped from ~150s of sequential LLM time
+to 76.1s total (bounded by the slower of the two concurrent calls, not
+their sum) with structurally identical output (same funnel, same
+availability tradeoffs, same core three-person team) -- individual
+fit_scores and which role each person landed in shifted between runs, which
+is expected LLM run-to-run stochasticity on independent calls, not a
+regression from parallelising. **Known limitation:** a role's API failure
+still aborts the whole `match()` call when `future.result()` re-raises it --
+same failure mode the sequential version already had, not a new one, and
+still no retry/backoff (consistent with `rerank_role`'s existing documented
+limitation).
+
+**What this means for the 2,000-CV scaling question:** the funnel design
+(hard filter -> fixed top-15 retrieval -> LLM re-rank) already decouples
+stage 3's cost from total corpus size -- `rerank_role` always scores a
+fixed-size shortlist regardless of whether the candidate pool is 21 or
+2,000, so growing the dataset alone doesn't slow the expensive stage down.
+What would need to change at that scale is stage 2: `hybrid_retrieve`
+currently recomputes every surviving candidate's embedding from scratch on
+every call (cheap at 21 candidates, wasteful at 2,000) and rebuilds the
+BM25 index per role even though the candidate pool doesn't change between
+roles within one `match()` call. Neither is fixed yet -- the fix is
+precomputing and caching each profile's embedding once (e.g. at extraction
+time) so retrieval only embeds the short role-query text live, and
+building the BM25 index once per `match()` call instead of once per role.
+A real vector index (FAISS etc.) isn't needed at 2,000 rows -- a cached
+numpy matrix with `sklearn.cosine_similarity` stays fast well beyond that.
+What scales worst is role count, not CV count: each additional distinct
+role adds another ~60-80s call: concurrency (this phase) already turns that
+from "sum of all roles' latency" into "roughly one call's worth," bounded
+by whatever request concurrency the Anthropic API allows.

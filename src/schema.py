@@ -165,8 +165,105 @@ class ProjectBrief(BaseModel):
     duration_weeks: int | None = Field(default=None, ge=1)
     seniority_mix: dict[SeniorityLevel, int] = Field(default_factory=dict)
     location: str | None = None
+    required_language: str | None = None  # added for src/match.py's hard-filter stage; see DECISIONS.md phase 3
     budget: str | None = None  # free text: often a range or "not disclosed"
     inferred_fields: list[str] = Field(
         default_factory=list,
         description="Names of fields the LLM guessed rather than read from the brief.",
     )
+
+
+class RoleFitScore(BaseModel):
+    """One LLM-scored verdict for one candidate against one role, with cited evidence (CLAUDE.md rule 4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    consultant_id: str
+    role_title: str
+    fit_score: float = Field(ge=0.0, le=100.0)
+    reasons: list[str] = Field(min_length=3, max_length=3)
+    concern: str = Field(min_length=1)
+
+
+class FilterFunnelStage(BaseModel):
+    """How many candidates survived one stage of the deterministic hard filter -- for the demo's funnel view."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str
+    survived: int = Field(ge=0)
+
+
+class TeamMember(BaseModel):
+    """One consultant assigned to one role in a proposed team, with the score breakdown that justified picking them."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role_title: str
+    consultant_id: str
+    fit_score: float = Field(ge=0.0, le=100.0)
+    reasons: list[str] = Field(min_length=3, max_length=3)
+    concern: str
+    availability_status: str
+    free_days_per_week: int = Field(ge=0, le=5)
+    next_free_date: str
+    assembly_score: float
+    adjustments: dict[str, float] = Field(
+        default_factory=dict,
+        description="Stage-4 score adjustments applied on top of fit_score, e.g. skill_overlap_penalty.",
+    )
+    selection_note: str = Field(
+        default="",
+        description="Why this member, specifically, was picked for this team variant (e.g. earliest available).",
+    )
+
+
+class StaffingGap(BaseModel):
+    """One role slot a team could not confidently fill -- either left empty, or filled below the fit-confidence bar."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role_title: str
+    reason: Literal["understaffed", "low_confidence_fit"]
+    detail: str
+    consultant_id: str | None = Field(
+        default=None, description="Set when reason is low_confidence_fit -- who was picked despite the weak fit."
+    )
+
+
+class Team(BaseModel):
+    """A full proposed staffing team: one member per required role slot, plus what it was optimised for."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: Literal["recommended", "earliest_start", "lowest_cost"]
+    members: list[TeamMember] = Field(default_factory=list)
+    gaps: list[StaffingGap] = Field(
+        default_factory=list,
+        description="Role slots this team could not confidently fill -- empty means fully, confidently staffed.",
+    )
+
+
+class AvailabilityTradeoff(BaseModel):
+    """A candidate who'd otherwise qualify for the project but isn't free until after the requested start date."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    consultant_id: str
+    next_free_date: str
+    days_after_start: int = Field(
+        description="How many days after the brief's requested start date this candidate becomes free."
+    )
+
+
+class MatchResult(BaseModel):
+    """Everything src/match.py produces for one project brief: the hard-filter funnel, and three candidate teams."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    funnel: list[FilterFunnelStage]
+    availability_tradeoffs: list[AvailabilityTradeoff] = Field(
+        default_factory=list,
+        description="Candidates dropped only by the availability filter -- the start-date-vs-fit tradeoff, surfaced.",
+    )
+    teams: list[Team]
