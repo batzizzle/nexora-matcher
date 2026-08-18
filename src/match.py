@@ -33,7 +33,10 @@ non-empty and still be flagged as a suggestion the tool doesn't actually
 trust -- see "Quantum Cryptographer" in DECISIONS.md phase 3 for why this
 exists: a role nobody in the dataset is remotely qualified for still
 produced a single-digit-fit "recommendation" with no visible signal that
-anything was wrong, until this flag was added.
+anything was wrong, until this flag was added. MatchResult also carries the
+full `role_rankings` (every stage-3-scored candidate per role, not just who
+was picked) -- phase 4's src/explain.py needs the runner-up, not just the
+winner, to build a counterfactual.
 
 Assumptions and shortcuts taken:
 - ProjectBrief gained a `required_language` field in this phase (see
@@ -813,4 +816,4 @@ def match(
         assemble_earliest_start_team(brief, role_rankings, profiles_by_id, availability_by_id),
         assemble_lowest_cost_team(brief, role_rankings, profiles_by_id, availability_by_id),
     ]
-    return MatchResult(funnel=funnel, availability_tradeoffs=tradeoffs, teams=teams)
+    return MatchResult(funnel=funnel, availability_tradeoffs=tradeoffs, teams=teams, role_rankings=role_rankings)

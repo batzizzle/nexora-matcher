@@ -267,3 +267,94 @@ class MatchResult(BaseModel):
         description="Candidates dropped only by the availability filter -- the start-date-vs-fit tradeoff, surfaced.",
     )
     teams: list[Team]
+    role_rankings: dict[str, list[RoleFitScore]] = Field(
+        default_factory=dict,
+        description=(
+            "Every stage-3-scored candidate per role, not just who was picked -- src/explain.py needs the "
+            "full ranking (not just the winner) to build a counterfactual against the next-best alternative."
+        ),
+    )
+
+
+TrustBadge = Literal["verified", "flagged", "unverified_claims"]
+
+
+class ScoreBreakdown(BaseModel):
+    """A deterministic, five-component explanation of fit -- complementary to fit_score, not a formula that sums to it.
+
+    fit_score is a single holistic LLM judgement; these five components are separately computed by plain Python
+    from structured data (skills, seniority, availability, industries, team composition) so a human can see which
+    specific dimension drove -- or hurt -- a recommendation, without re-deriving it from prose.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    skill_fit: float = Field(ge=0.0, le=100.0)
+    seniority_fit: float = Field(ge=0.0, le=100.0)
+    availability: float = Field(ge=0.0, le=100.0)
+    industry_experience: float = Field(ge=0.0, le=100.0)
+    team_chemistry: float = Field(ge=0.0, le=100.0)
+
+
+class EvidenceQuote(BaseModel):
+    """One verbatim CV sentence backing a skill claim, with a best-effort guess at which project it came from."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    quote: str = Field(min_length=1, description="Verbatim, taken directly from Skill.evidence -- never paraphrased.")
+    skill_name: str
+    project_title: str | None = Field(
+        default=None, description="Best-effort attribution via tech-list overlap; None if no project could be matched."
+    )
+
+
+class Counterfactual(BaseModel):
+    """The next-best candidate for the same role, and a one-sentence, breakdown-delta-generated gain/lose statement."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    consultant_id: str
+    fit_score: float = Field(ge=0.0, le=100.0)
+    breakdown: ScoreBreakdown
+    trust_badge: TrustBadge = Field(
+        description="The alternative's own trust badge -- a swap suggestion must never drop this signal."
+    )
+    summary: str = Field(min_length=1, description="Deterministically templated from score-breakdown deltas, not an LLM call.")
+
+
+class AvailabilityAlternative(BaseModel):
+    """A currently-unavailable candidate whose deterministic breakdown beats the pick for this role -- not LLM-scored.
+
+    Distinct from Counterfactual: this candidate never went through stage 3 (they failed the availability hard
+    filter before retrieval/re-ranking ever saw them), so there is no fit_score to report -- only the deterministic
+    ScoreBreakdown comparison src/explain.py can compute without them ever having been scored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    consultant_id: str
+    next_free_date: str
+    days_after_start: int
+    breakdown: ScoreBreakdown
+    trust_badge: TrustBadge
+    summary: str = Field(min_length=1, description="Deterministically templated from score-breakdown deltas, not an LLM call.")
+
+
+class MatchCard(BaseModel):
+    """Everything src/explain.py produces to explain one consultant's fit for one role: score, evidence, trust, alternative."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    consultant_id: str
+    role_title: str
+    overall_score: float = Field(ge=0.0, le=100.0)
+    breakdown: ScoreBreakdown
+    evidence: list[EvidenceQuote] = Field(max_length=3)
+    trust_badge: TrustBadge
+    counterfactual: Counterfactual | None = Field(
+        default=None, description="None only when no other ranked candidate exists for this role to compare against."
+    )
+    availability_alternative: AvailabilityAlternative | None = Field(
+        default=None,
+        description="A currently-unavailable candidate who'd deterministically beat this pick -- None if nobody does.",
+    )

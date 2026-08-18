@@ -516,3 +516,206 @@ What scales worst is role count, not CV count: each additional distinct
 role adds another ~60-80s call: concurrency (this phase) already turns that
 from "sum of all roles' latency" into "roughly one call's worth," bounded
 by whatever request concurrency the Anthropic API allows.
+
+## Phase 4 (part 1) — Explanation (`src/explain.py`)
+
+**What was built:** `build_match_card` / `build_match_cards_for_team`, which turn one
+`TeamMember` (from `src/match.py`'s stage 4) into a `MatchCard`: an overall score, a
+deterministic five-component breakdown (skill fit, seniority fit, availability,
+industry experience, team chemistry), up to three verbatim CV evidence quotes with a
+best-effort project attribution, a trust badge (verified / flagged / unverified
+claims), and a counterfactual against the next-best candidate who wasn't picked. Zero
+new LLM calls anywhere in this file -- everything is either reused directly from
+`src/match.py`'s stage-3 output or computed by plain Python over structured data
+already sitting in `ConsultantProfile`, `availability.csv`, and the co-delivery
+graph, per the phase-4 brief's explicit requirement that the counterfactual come from
+score-breakdown deltas, not an extra call.
+
+**Coverage check against phase 3 before building (per the phase-4 brief's own
+instruction to skip what's already covered):** overall score and the per-candidate
+concern were already on `TeamMember` (`fit_score`, `concern`) and are reused, not
+rebuilt. Everything else -- the five-component breakdown, verbatim evidence
+selection, the trust badge, and the counterfactual -- had no prior implementation:
+`TeamMember.adjustments` is a different three-way decomposition for team *assembly*
+(skill-overlap penalty / co-delivery bonus / booking penalty), not a candidate-facing
+explanation; `TeamMember.reasons` are LLM prose *about* evidence, not verbatim CV
+quotes; and the data a counterfactual needs (every stage-3-scored candidate per role,
+not just the winner) was computed inside `match()` but discarded once teams were
+assembled.
+
+**Key design decisions and the alternative rejected:**
+- **`MatchResult` gained a `role_rankings` field** (every `RoleFitScore` per role,
+  not just who was picked) -- rejected either recomputing rankings inside
+  `src/explain.py` (would re-trigger LLM calls stage 3 already paid for, and violate
+  the "no extra LLM call" requirement in spirit even though the call itself isn't
+  what powers the counterfactual) or threading `role_rankings` through as a bare
+  parameter instead of a schema field (loses the "one MatchResult carries everything
+  a caller needs" property `funnel` and `availability_tradeoffs` already established
+  in phase 3).
+- **The five breakdown components are a separately-computed, deterministic
+  *explanation* of fit, not a formula whose weighted sum reproduces `fit_score`** --
+  rejected trying to reverse-engineer weights that would make the five components
+  sum to the LLM's holistic score. `fit_score` is a single judgement call the model
+  makes over everything at once (including things these five proxies can't see, like
+  how compellingly a project's impact reads); forcing an exact arithmetic
+  relationship would mean either the proxies stop being honest independent measures
+  or the breakdown stops matching the score, and lying about either is worse than a
+  breakdown that's presented as a complementary lens rather than a decomposition.
+  Verified this divergence is real and useful, not just theoretical, on live data:
+  Katrine Pedersen scored `fit_score=85` (the LLM correctly read "Predictive
+  Modeling" as semantically close enough to the role's "Predictive Analytics"
+  requirement) but `skill_fit=33.3` (the deterministic exact-match component
+  correctly does *not* treat those as the same string) -- both numbers are honest,
+  and showing both is more useful than picking one.
+- **`team_chemistry` is recomputed fresh against a team's final roster, not reused
+  from `TeamMember.adjustments`** -- rejected reusing the stored field because it
+  only exists for the "recommended" team (the two alternative teams leave
+  `adjustments` empty, per phase 3's design) and is itself an order-dependent
+  snapshot from greedy assembly (computed against whoever had already been picked
+  *at that point*), not a description of the finished team. Recomputing gives every
+  team variant, and every card -- including the counterfactual's alternative
+  candidate, who was never actually assembled into anything -- the same
+  well-defined, order-independent answer.
+- **Evidence quotes are deduped by exact quote text, not just picked by
+  required-skill-match-then-confidence** -- discovered necessary from real data, not
+  anticipated in the initial design: several CVs in the dataset quote a whole
+  "Technical Skills:" list line as the verbatim evidence for *every* skill on that
+  line (a legitimate quote per `src/extract.py`'s rules when nothing more specific
+  exists per-skill). Without deduping, a card's "top three evidence sentences" could
+  be the same sentence three times, which defeats the stated purpose. Fixed by
+  skipping any skill whose evidence text was already selected and continuing down
+  the ranked list, verified against Katrine Pedersen's real profile (10 of her 24
+  skills shared one identical evidence string).
+- **skill_fit and industry_experience reuse phase 3's exact-match (case-insensitive,
+  trimmed) convention, not fuzzy matching** -- same rejected alternative and same
+  reasoning as `src/match.py`'s hard filter (see phase 3): a false-positive "good
+  fit" signal from fuzzy matching is worse than an honest low score on a real match
+  phrased differently.
+- **The counterfactual's "next-best candidate" is picked by highest `fit_score`
+  among the remainder, not by any breakdown component** -- rejected picking by, say,
+  highest `skill_fit`, since `fit_score` is what stage 3's ranking is actually
+  sorted by and what a user would recognise as "the next name down the list."
+  Candidates already staffed elsewhere on the *same* team are excluded, since
+  swapping in someone already committed to another role isn't an actionable trade.
+
+**Assumptions made:**
+- All five breakdown-component weights (seniority-mismatch penalty per tier,
+  availability scoring by status, industry match/no-match scores, team-chemistry
+  baseline/bonus/penalty) are tunable PoC constants flagged inline in
+  `src/explain.py`, not validated against any labelled "this explanation was
+  actually accurate" dataset -- none exists here, same caveat as phase 3's assembly
+  weights.
+- Project attribution for an evidence quote (`EvidenceQuote.project_title`) is a
+  best-effort guess -- the first project whose `tech` list names the skill, or
+  `None` if none does -- because `src/schema.py`'s `Skill` and `Project` models have
+  no structural link between them. Verified against real data this produces `None`
+  reasonably often (e.g. a skill like "Time Series Analysis" that appears in a
+  profile's top skills list but not literally in any project's `tech` list), which
+  is an honest "couldn't attribute this" rather than a guess dressed up as certain.
+- The trust badge only distinguishes three states computed from data already
+  produced upstream (`ConsultantProfile.trust_flags`, `extraction_confidence`) -- it
+  does not re-verify that any evidence quote is an actual substring of the raw CV
+  text, which is the same known limitation `src/extract.py` and `src/trust.py`
+  already document (see phase 2).
+
+**Known limitations / what would need to change for production:**
+- No UI yet (`app.py` per `CLAUDE.md`'s repo layout is still unbuilt) -- match cards
+  were verified against real data via a one-off script printing them to the
+  terminal, not through the Streamlit app this phase's name ("Explanation & UI")
+  implies is still to come.
+- The five breakdown weights are hand-picked, not tuned against any ground truth,
+  same limitation as phase 3's assembly weights.
+- Evidence-quote deduplication only catches *exact* duplicate strings -- two
+  differently-worded evidence quotes that both describe the same underlying claim
+  would still both be shown, since there's no semantic dedup, only literal.
+
+### Phase 4 (part 1) follow-ups from live demo testing
+
+Testing real briefs (including one deliberately aimed at CV4, the CV with a
+confirmed prompt-injection attempt -- see phase 2) surfaced three more gaps, each
+fixed the same session:
+
+**1. `Counterfactual.trust_badge` (src/schema.py, src/explain.py).** Running a real
+"ERP change management, manufacturing" brief, one candidate's counterfactual pointed
+at CV4 with the summary "would improve every component... with no clear downside" --
+true of the score breakdown, but silent about CV4's flagged CV. `Counterfactual` had
+no `trust_badge` field, so the one signal that should stop someone from acting on a
+swap suggestion could never appear on it. Added `trust_badge` to `Counterfactual`,
+and `_summarize_swap` now appends a trust caveat whenever the alternative isn't
+"verified" (`_TRUST_CAVEATS`). Verified against the exact real scenario: the summary
+now reads "...with no clear downside. Note: this candidate's CV has a flagged trust
+issue -- see their trust badge before acting on this."
+
+**2. `MatchCard.availability_alternative` (src/schema.py, src/explain.py) -- the
+feature this part was built to add.** `MatchResult.availability_tradeoffs` (phase 3)
+and `Counterfactual` (this phase) were completely disconnected: a `Counterfactual` is
+only ever built from `role_ranking`, which only contains candidates who survived
+`hard_filter` -- so a candidate excluded for availability alone, however strong a fit
+they'd score, could never appear as a counterfactual, only in the separate, unscored,
+brief-wide tradeoffs list with no role attached. Added `AvailabilityAlternative` (a
+deliberately different shape from `Counterfactual`, not a `Counterfactual` with an
+optional `fit_score` -- these candidates never went through stage 3, so there
+genuinely is no `fit_score` to report) and `build_availability_alternative`, which
+deterministically breakdown-scores every tradeoff candidate against a role and
+surfaces the best one, but only when their future-fit rank (`skill_fit`,
+`seniority_fit`, `industry_experience`, `team_chemistry` -- `availability` itself is
+deliberately excluded from the ranking key, since every tradeoff candidate's
+availability score is low by construction and would only add a constant offset, not
+signal) genuinely exceeds the pick's -- a card showing "here's someone worse who's
+also unavailable" on every role would be noise, not signal. Verified against real
+data: Louise Damgaard (S&OP/Demand Planning, Consumer Goods/FMCG industry, but
+`fully_booked`) correctly surfaces on Ida Mørk's real Forecasting Analyst card
+("+55 industry experience, -20 availability... not free until 6 days after your
+requested start"). **Measured, not assumed, before building:** `compute_breakdown`
+costs ~11 microseconds/call: a realistic brief (6 tradeoff candidates x 2 roles) adds
+~0.13ms; a pathological 2,000-CV worst case (200 tradeoff candidates x 5 roles) adds
+~11ms -- versus the 60-80 *seconds* per `rerank_role` call that actually dominates
+`match()`'s wall time (phase 3). No LLM call, no embedding call -- pure Python over
+data already in memory.
+
+**3. `classify_trust` was over-flagging roughly half the real dataset -- found and
+fixed, not part of the original plan.** The original implementation treated any
+non-empty `trust_flags` as `"flagged"`. Checked against all 21 real profiles: ~10
+would have shown "flagged", including CVs whose *only* trust_flags entry explicitly
+cleared them -- e.g. `"No prompt injection or adversarial text detected in the
+document."`, which literally contains the word "injection" while saying the
+opposite. `src/extract.py`'s self-reported `trust_flags` entries are free text with
+no consistent structure (verified: they range from genuine concerns to entirely
+benign extraction caveats like "no certifications section found" or "project years
+inferred from employment dates", with no reliable way to distinguish them from
+wording alone) -- only the *scanned* entries `_merge_trust_flags` produces have a
+guaranteed structure (`"injection (...)"` / `"promotional_language (...)"`, and are
+already filtered to exclude "benign" classifications before merging). **Fix:**
+`classify_trust` now only fires `"flagged"` on that structured prefix, and uses
+`extraction_confidence` alone (not trust_flags non-emptiness) for
+`"unverified_claims"`, since confidence is a consistent numeric signal computed the
+same way for every profile. **Rejected:** a keyword search (e.g. "injection" or
+"promotional" anywhere in the flag text) as a middle-ground fix -- rejected because
+it still would have flagged the self-reported "No prompt injection detected"
+entries, which contain the trigger word while asserting the opposite finding.
+**Verified against the full real dataset, before vs. after:** ~10/21 "flagged" before
+→ exactly 2/21 non-"verified" after (`cv4`: flagged, the real confirmed injection;
+`cvs_ppt_format_slide2`: unverified_claims, the real name-mismatch/low-confidence
+case from phase 2 -- extraction_confidence 0.55, the lowest in the dataset), with
+every other profile now correctly "verified".
+
+**Assumptions made (this part):**
+- `AvailabilityAlternative`'s "best of the tradeoffs list" ranking is a plain mean of
+  four breakdown components, not a validated weighting -- same caveat as every other
+  scoring constant in `src/match.py` and `src/explain.py`.
+- The "only surface if strictly better" comparison uses no margin (any positive
+  difference in future-fit rank qualifies) -- a small margin might reduce noise from
+  near-tied comparisons, but wasn't judged necessary without evidence of it being a
+  real problem in practice.
+
+**Known limitations (this part):**
+- `classify_trust`'s three-tier design still can't recover a genuine self-reported-
+  only finding that `src/trust.py`'s stage-1 regex patterns miss entirely (no
+  structured flag would ever be produced for it) -- mitigated but not eliminated by
+  stage 1 being deliberately broad/recall-oriented (see phase 2), not eliminated by
+  design.
+- `AvailabilityAlternative` only compares a tradeoff candidate against the single
+  role a match card is already about -- it does not search across every role in the
+  brief for the tradeoff candidate's single best-fitting role, so a tradeoff
+  candidate who'd be a mediocre fit for the role being explained but an excellent
+  fit for a *different* role in the same brief will never surface anywhere.
