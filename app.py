@@ -47,10 +47,13 @@ Assumptions and shortcuts taken:
   per-step durations are captured in that same dict and rendered afterwards as a
   small bar chart (render_bar_funnel) -- on a cache hit (identical brief resubmitted)
   these read as near-zero, which is an honest reflection of what happened, not a bug.
-- Team availability and the consultant co-delivery network are their own always-
-  visible expanders, shown before any brief has been run -- not gated behind a
-  match result. When a result does exist, the network diagram highlights the
-  current recommended team's members in a different colour from everyone else.
+- Team availability and the consultant co-delivery network live in a "General
+  info" section above the brief input -- always-visible expanders, not gated
+  behind running a brief, so a viewer sees the underlying data before typing
+  anything. When a result does exist, the network diagram highlights the
+  current recommended team's members in a different colour from everyone else;
+  "Find team" forces a full script rerun (st.rerun()) after saving the result
+  so that highlight appears immediately instead of one click later.
 - The co-delivery network is a hand-rolled inline-SVG circular-layout diagram
   (network_layout + render_co_delivery_network), not graphviz or networkx -- neither
   is installed, and a self-contained SVG needs no dependency at all, guaranteeing it
@@ -621,6 +624,24 @@ def main() -> None:
             if st.button(label, key=f"history_{i}", use_container_width=True):
                 st.session_state.current = entry
 
+    current = st.session_state.current
+    highlight_ids: set[str] = set()
+    if current is not None:
+        recommended_team = next((t for t in current["result"].teams if t.label == "recommended"), None)
+        if recommended_team is not None:
+            highlight_ids = {m.consultant_id for m in recommended_team.members}
+
+    st.subheader("ℹ️ General info")
+    with st.expander("📅 Team availability", expanded=False):
+        render_availability_heatmap(profiles, availability_by_id, names_by_id)
+    with st.expander("🔗 Consultant network (team chemistry)", expanded=False):
+        render_co_delivery_network(graph, names_by_id, highlight_ids)
+        render_co_delivery_graph(graph, names_by_id)
+    with st.expander("🔍 Data quality", expanded=False):
+        # Depends only on the loaded-once profile pool, not on any run's brief/result -- lives in
+        # General info rather than the per-run tabs below so it doesn't imply it changes per brief.
+        render_data_quality(profiles, names_by_id)
+
     st.subheader("📝 1. Project brief")
     example_cols = st.columns(len(_EXAMPLE_BRIEFS))
     for col, (label, text) in zip(example_cols, _EXAMPLE_BRIEFS.items()):
@@ -666,20 +687,7 @@ def main() -> None:
         }
         st.session_state.history.insert(0, entry)
         st.session_state.current = entry
-
-    current = st.session_state.current
-
-    highlight_ids: set[str] = set()
-    if current is not None:
-        recommended_team = next((t for t in current["result"].teams if t.label == "recommended"), None)
-        if recommended_team is not None:
-            highlight_ids = {m.consultant_id for m in recommended_team.members}
-
-    with st.expander("📅 Team availability", expanded=False):
-        render_availability_heatmap(profiles, availability_by_id, names_by_id)
-    with st.expander("🔗 Consultant network (team chemistry)", expanded=False):
-        render_co_delivery_network(graph, names_by_id, highlight_ids)
-        render_co_delivery_graph(graph, names_by_id)
+        st.rerun()  # re-run from the top so the General info network diagram highlights the new team immediately
 
     if current is None:
         return
@@ -710,13 +718,11 @@ def main() -> None:
         result.availability_tradeoffs, names_by_id,
     )
 
-    st.subheader("📊 4. Alternatives & data quality")
+    st.subheader("📊 4. Alternatives")
     earliest = next(t for t in result.teams if t.label == "earliest_start")
     lowest_cost = next(t for t in result.teams if t.label == "lowest_cost")
 
-    tab_earliest, tab_cheapest, tab_quality = st.tabs(
-        [_TEAM_LABELS["earliest_start"], _TEAM_LABELS["lowest_cost"], "Data quality"]
-    )
+    tab_earliest, tab_cheapest = st.tabs([_TEAM_LABELS["earliest_start"], _TEAM_LABELS["lowest_cost"]])
     with tab_earliest:
         render_team(
             earliest, brief, result.role_rankings, profiles_by_id, availability_by_id, graph,
@@ -727,8 +733,6 @@ def main() -> None:
             lowest_cost, brief, result.role_rankings, profiles_by_id, availability_by_id, graph,
             result.availability_tradeoffs, names_by_id,
         )
-    with tab_quality:
-        render_data_quality(profiles, names_by_id)
 
 
 if __name__ == "__main__":

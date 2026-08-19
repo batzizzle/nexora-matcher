@@ -224,13 +224,28 @@ def _passes_must_have_skills(profile: ConsultantProfile, brief: ProjectBrief) ->
     return all(skill.strip().lower() in have for skill in brief.must_have_skills)
 
 
+_LOCATION_SPLIT_RE = re.compile(r"\s*(?:/|,|\bor\b|\band\b)\s*", re.IGNORECASE)
+
+
+def _split_locations(location: str) -> list[str]:
+    """Split a possibly multi-city brief location ("Stockholm / Copenhagen / Oslo / Aarhus") into individual cities."""
+    return [part for part in _LOCATION_SPLIT_RE.split(location) if part]
+
+
 def _passes_location(profile: ConsultantProfile, brief: ProjectBrief) -> bool:
-    """Drop candidates whose location doesn't contain (or isn't contained by) the brief's location, if one is set."""
+    """Drop candidates whose location doesn't contain (or isn't contained by) any one of the brief's cities, if set.
+
+    brief.location can name several acceptable cities ("Stockholm / Copenhagen / Oslo / Aarhus") -- matching that
+    whole string against a candidate's single-city "Copenhagen, Denmark" as one substring check always fails (the
+    combined string is never a substring of one city, and one city plus its country suffix is never a substring of
+    the combined string), which silently dropped every candidate on any multi-city brief. Splitting into individual
+    cities and matching any one of them fixes that while keeping the same per-city substring rule.
+    """
     if not brief.location:
         return True
-    target = brief.location.strip().lower()
     location = profile.location.strip().lower()
-    return target in location or location in target
+    targets = _split_locations(brief.location.strip().lower())
+    return any(target in location or location in target for target in targets)
 
 
 def hard_filter(

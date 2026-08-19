@@ -195,6 +195,12 @@ def test_passes_location_matches_substring_either_direction():
     assert _passes_location(profile, make_brief(location=None)) is True
 
 
+def test_passes_location_matches_any_city_in_a_multi_city_brief():
+    profile = make_profile("p1", location="Copenhagen, Denmark")
+    assert _passes_location(profile, make_brief(location="Stockholm / Copenhagen / Oslo / Aarhus")) is True
+    assert _passes_location(profile, make_brief(location="Stockholm, Oslo or Aarhus")) is False
+
+
 def test_hard_filter_funnel_reports_survivors_at_every_stage_in_order():
     survivor = make_profile("survivor", skills=[make_skill("Python")], languages=[make_language("English")])
     wrong_skill = make_profile("wrong_skill", skills=[make_skill("Java")], languages=[make_language("English")])

@@ -846,3 +846,58 @@ without a hand-built `ProjectBrief` object anywhere in the loop.
 - No deployment story exists or was requested -- `app.py` is a local
   `streamlit run` dev server; the URL it serves on is not stable across sessions,
   and there is currently no way to reach it without running that command yourself.
+
+## Post-phase-4 bugfix — multi-city briefs zeroed out the entire candidate pool
+
+**What was built:** Fixed `_passes_location` in `src/match.py`. A live run of the
+brief "Enterprise Agility in Automotive, from October 1st, team in Stockholm,
+Copenhagen, Oslo or Arhus, with budget of 100k for 3 months" returned zero
+candidates for every role. The extracted `brief.location` was
+`"Stockholm / Copenhagen / Oslo / Aarhus"` -- a single combined string, reasonable
+extraction. `_passes_location` compared that whole string against a candidate's
+single-city `"Copenhagen, Denmark"` as one bidirectional substring check, which
+can never match a multi-city brief against a single-city profile (neither string
+is a substring of the other once the city + ", Denmark"/combined-list punctuation
+is accounted for) -- so the location filter silently dropped all 18 survivors of
+the earlier stages, not just the three specific consultants the user expected to
+see (Jonas Kristensen, Nikolaj Friis, Sebastian Knudsen).
+
+**Key design decision:** Added `_split_locations`, which splits `brief.location`
+on `/`, `,`, `or`, `and` into individual cities, then passes if *any* one of them
+matches the candidate's location by the existing per-city substring rule.
+**Rejected** changing `ProjectBrief.location` to a `list[str]` in the schema --
+this is a deterministic-Python filter bug (CLAUDE.md rule 1 territory), not an
+extraction-prompt ambiguity, so per the project's convention (see phase 2) the
+fix stays in `src/match.py`'s filter logic rather than growing the schema.
+
+**Assumptions made:** the same per-city substring rule (either direction) still
+applies per split city -- e.g. a brief city of "Denmark" still matches any
+Danish city, and a candidate's fuller "Aarhus, Denmark, Europe" still matches a
+brief's plain "Aarhus". Only the multi-city splitting is new.
+
+**Known limitations:** the split regex handles the delimiters actually observed
+from the LLM's extraction (`/`, `,`, `or`, `and`) -- a brief location string using
+some other separator (e.g. `;` or `&`) would still be treated as one un-split
+city and could silently under-match. Not fixed here since no such case has been
+observed; would need a real example to design against, per this project's
+convention of not guessing at unvalidated edge cases.
+
+## Post-phase-4 UI tweak — moved "Data quality" into General info
+
+**What was built:** In `app.py`, moved the "Data quality" panel out of section
+4's per-run tabs (alongside the Earliest start / Lowest cost alternative teams)
+and into the "General info" section at the top of the page, as a third expander
+next to "Team availability" and "Consultant network (team chemistry)".
+
+**Key design decision:** `render_data_quality` only ever reads `profiles` and
+`names_by_id` -- both loaded once at app startup -- and never touches
+`brief`/`result` from the current run. Living inside the per-run tabs implied it
+was a property of that run's matching result, which it isn't: it reports the
+same trust-flag and extraction-note findings for the whole corpus regardless of
+which brief was just typed in. General info is where every other run-independent
+panel already lives, so this is a placement fix, not a behavioural change --
+`render_data_quality` itself is untouched.
+
+**Assumptions made:** none new; section 4 was renamed from "Alternatives & data
+quality" back to plain "Alternatives" now that it only holds the two alternative
+teams.
